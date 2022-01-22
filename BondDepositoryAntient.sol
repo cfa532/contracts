@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 pragma solidity 0.7.5;
+pragma abicoder v2;
 
 interface IOwnable {
   function policy() external view returns (address);
@@ -11,43 +12,61 @@ interface IOwnable {
   function pullManagement() external;
 }
 
-contract Ownable is IOwnable {
+contract OwnableData {
+    address public owner;
+    address public pendingOwner;
+}
 
-    address internal _owner;
-    address internal _newOwner;
+contract Ownable is OwnableData {
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
-    event OwnershipPushed(address indexed previousOwner, address indexed newOwner);
-    event OwnershipPulled(address indexed previousOwner, address indexed newOwner);
-
-    constructor () {
-        _owner = msg.sender;
-        emit OwnershipPushed( address(0), _owner );
+    /// @notice `owner` defaults to msg.sender on construction.
+    constructor() {
+        owner = msg.sender;
+        emit OwnershipTransferred(address(0), msg.sender);
     }
 
-    function policy() public view override returns (address) {
-        return _owner;
+    /// @notice Transfers ownership to `newOwner`. Either directly or claimable by the new pending owner.
+    /// Can only be invoked by the current `owner`.
+    /// @param newOwner Address of the new owner.
+    /// @param direct True if `newOwner` should be set immediately. False if `newOwner` needs to use `claimOwnership`.
+    /// @param renounce Allows the `newOwner` to be `address(0)` if `direct` and `renounce` is True. Has no effect otherwise.
+    function transferOwnership(
+        address newOwner,
+        bool direct,
+        bool renounce
+    ) public onlyOwner {
+        if (direct) {
+            // Checks
+            require(newOwner != address(0) || renounce, "Ownable: zero address");
+
+            // Effects
+            emit OwnershipTransferred(owner, newOwner);
+            owner = newOwner;
+            pendingOwner = address(0);
+        } else {
+            // Effects
+            pendingOwner = newOwner;
+        }
     }
 
-    modifier onlyPolicy() {
-        require( _owner == msg.sender, "Ownable: caller is not the owner" );
+    /// @notice Needs to be called by `pendingOwner` to claim ownership.
+    function claimOwnership() public {
+        address _pendingOwner = pendingOwner;
+
+        // Checks
+        require(msg.sender == _pendingOwner, "Ownable: caller != pending owner");
+
+        // Effects
+        emit OwnershipTransferred(owner, _pendingOwner);
+        owner = _pendingOwner;
+        pendingOwner = address(0);
+    }
+
+    /// @notice Only allows the `owner` to execute the function.
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Ownable: caller is not the owner");
         _;
-    }
-
-    function renounceManagement() public virtual override onlyPolicy() {
-        emit OwnershipPushed( _owner, address(0) );
-        _owner = address(0);
-    }
-
-    function pushManagement( address newOwner_ ) public virtual override onlyPolicy() {
-        require( newOwner_ != address(0), "Ownable: new owner is the zero address");
-        emit OwnershipPushed( _owner, newOwner_ );
-        _newOwner = newOwner_;
-    }
-    
-    function pullManagement() public virtual override {
-        require( msg.sender == _newOwner, "Ownable: must be new owner to pull");
-        emit OwnershipPulled( _owner, _newOwner );
-        _owner = _newOwner;
     }
 }
 
@@ -251,7 +270,6 @@ library Address {
 
     }
 }
-
 interface IERC20 {
     function decimals() external view returns (uint8);
 
@@ -396,41 +414,14 @@ library FixedPoint {
     }
 }
 
-interface AggregatorV3Interface {
-
-  function decimals() external view returns (uint8);
-  function description() external view returns (string memory);
-  function version() external view returns (uint256);
-
-  // getRoundData and latestRoundData should both raise "No data present"
-  // if they do not have data to report, instead of returning unset values
-  // which could be misinterpreted as actual reported values.
-  function getRoundData(uint80 _roundId)
-    external
-    view
-    returns (
-      uint80 roundId,
-      int256 answer,
-      uint256 startedAt,
-      uint256 updatedAt,
-      uint80 answeredInRound
-    );
-  function latestRoundData()
-    external
-    view
-    returns (
-      uint80 roundId,
-      int256 answer,
-      uint256 startedAt,
-      uint256 updatedAt,
-      uint80 answeredInRound
-    );
-}
-
 interface ITreasury {
     function deposit( uint _amount, address _token, uint _profit ) external returns ( uint );
     function valueOfToken( address _token, uint _amount ) external view returns ( uint value_ );
-    function mintRewards( address _recipient, uint _amount ) external;
+}
+
+interface IBondCalculator {
+    function valuation( address _LP, uint _amount ) external view returns ( uint );
+    function markdown( address _LP ) external view returns ( uint );
 }
 
 interface IStaking {
@@ -441,16 +432,10 @@ interface IStakingHelper {
     function stake( uint _amount, address _recipient ) external;
 }
 
-interface IWMATIC9 is IERC20 {
-    /// @notice Deposit ether to get wrapped ether
-    function deposit() external payable;
-}
-
-contract MaiaBondDepository is Ownable {
+contract TimeBondDepository is Ownable {
 
     using FixedPoint for *;
     using SafeERC20 for IERC20;
-    using SafeERC20 for IWMATIC9;
     using LowGasSafeMath for uint;
     using LowGasSafeMath for uint32;
 
@@ -463,17 +448,23 @@ contract MaiaBondDepository is Ownable {
     event BondRedeemed( address indexed recipient, uint payout, uint remaining );
     event BondPriceChanged( uint indexed priceInUSD, uint indexed internalPrice, uint indexed debtRatio );
     event ControlVariableAdjustment( uint initialBCV, uint newBCV, uint adjustment, bool addition );
-
+    event InitTerms( Terms terms);
+    event LogSetTerms(PARAMETER param, uint value);
+    event LogSetAdjustment( Adjust adjust);
+    event LogSetStaking( address indexed stakingContract, bool isHelper);
+    event LogRecoverLostToken( address indexed tokenToRecover, uint amount);
 
 
 
     /* ======== STATE VARIABLES ======== */
+
     IERC20 public immutable Time; // token given as payment for bond
-    IWMATIC9 public immutable principle; // token used to create bond
+    IERC20 public immutable principle; // token used to create bond
     ITreasury public immutable treasury; // mints Time when receives principle
     address public immutable DAO; // receives profit share from bond
 
-    AggregatorV3Interface public priceFeed;
+    bool public immutable isLiquidityBond; // LP and Reserve bonds are treated slightly different
+    IBondCalculator public immutable bondCalculator; // calculates value of LP tokens
 
     IStaking public staking; // to auto-stake payout
     IStakingHelper public stakingHelper; // to stake and claim if no staking warmup
@@ -487,17 +478,19 @@ contract MaiaBondDepository is Ownable {
     uint public totalDebt; // total value of outstanding bonds; used for pricing
     uint32 public lastDecay; // reference time for debt decay
 
-
     mapping (address => bool) public allowedZappers;
 
+
+    uint256 public startRedeem;
 
     /* ======== STRUCTS ======== */
 
     // Info for creating new bonds
     struct Terms {
         uint controlVariable; // scaling variable for price
-        uint minimumPrice; // vs principle value. 4 decimals (1500 = 0.15)
+        uint minimumPrice; // vs principle value
         uint maxPayout; // in thousandths of a %. i.e. 500 = 0.5%
+        uint fee; // as % of bond payout, in hundreths. ( 500 = 5% = 0.05 for every 1 paid)
         uint maxDebt; // 9 decimal debt ratio, max % total supply created as debt
         uint32 vestingTerm; // in seconds
     }
@@ -506,8 +499,8 @@ contract MaiaBondDepository is Ownable {
     struct Bond {
         uint payout; // Time remaining to be paid
         uint pricePaid; // In DAI, for front end viewing
-        uint32 vesting; // Seconds left to vest
         uint32 lastTime; // Last interaction
+        uint32 vesting; // Seconds left to vest
     }
 
     // Info for incremental adjustments to control variable 
@@ -528,73 +521,84 @@ contract MaiaBondDepository is Ownable {
         address _Time,
         address _principle,
         address _treasury, 
-        address _DAO,
-        address _feed
+        address _DAO, 
+        address _bondCalculator
     ) {
         require( _Time != address(0) );
         Time = IERC20(_Time);
         require( _principle != address(0) );
-        principle = IWMATIC9(_principle);
+        principle = IERC20(_principle);
         require( _treasury != address(0) );
         treasury = ITreasury(_treasury);
         require( _DAO != address(0) );
         DAO = _DAO;
-        require( _feed != address(0) );
-        priceFeed = AggregatorV3Interface( _feed );
+        // bondCalculator should be address(0) if not LP bond
+        bondCalculator = IBondCalculator(_bondCalculator);
+        isLiquidityBond = ( _bondCalculator != address(0) );
     }
 
     /**
      *  @notice initializes bond parameters
      *  @param _controlVariable uint
-     *  @param _vestingTerm uint
+     *  @param _vestingTerm uint32
      *  @param _minimumPrice uint
      *  @param _maxPayout uint
+     *  @param _fee uint
      *  @param _maxDebt uint
      */
     function initializeBondTerms( 
         uint _controlVariable, 
         uint _minimumPrice,
         uint _maxPayout,
+        uint _fee,
         uint _maxDebt,
         uint32 _vestingTerm
-    ) external onlyPolicy() {
-        require( currentDebt() == 0, "Debt must be 0 for initialization" );
+    ) external onlyOwner() {
+        require( terms.controlVariable == 0, "Bonds must be initialized from 0" );
         require( _controlVariable >= 40, "Can lock adjustment" );
         require( _maxPayout <= 1000, "Payout cannot be above 1 percent" );
         require( _vestingTerm >= 129600, "Vesting must be longer than 36 hours" );
+        require( _fee <= 10000, "DAO fee cannot exceed payout" );
         terms = Terms ({
             controlVariable: _controlVariable,
-            vestingTerm: _vestingTerm,
             minimumPrice: _minimumPrice,
             maxPayout: _maxPayout,
-            maxDebt: _maxDebt
+            fee: _fee,
+            maxDebt: _maxDebt,
+            vestingTerm: _vestingTerm
         });
+        startRedeem = block.timestamp + 10 days;
         lastDecay = uint32(block.timestamp);
+        emit InitTerms(terms);
     }
 
 
 
-    
+
     /* ======== POLICY FUNCTIONS ======== */
 
-    enum PARAMETER { VESTING, PAYOUT, DEBT, MINPRICE }
+    enum PARAMETER { VESTING, PAYOUT, FEE, DEBT, MINPRICE }
     /**
      *  @notice set parameters for new bonds
      *  @param _parameter PARAMETER
      *  @param _input uint
      */
-    function setBondTerms ( PARAMETER _parameter, uint _input ) external onlyPolicy() {
+    function setBondTerms ( PARAMETER _parameter, uint _input ) external onlyOwner() {
         if ( _parameter == PARAMETER.VESTING ) { // 0
             require( _input >= 129600, "Vesting must be longer than 36 hours" );
             terms.vestingTerm = uint32(_input);
         } else if ( _parameter == PARAMETER.PAYOUT ) { // 1
             require( _input <= 1000, "Payout cannot be above 1 percent" );
             terms.maxPayout = _input;
-        } else if ( _parameter == PARAMETER.DEBT ) { // 2
+        } else if ( _parameter == PARAMETER.FEE ) { // 2
+            require( _input <= 10000, "DAO fee cannot exceed payout" );
+            terms.fee = _input;
+        } else if ( _parameter == PARAMETER.DEBT ) { // 3
             terms.maxDebt = _input;
-        } else if ( _parameter == PARAMETER.MINPRICE ) { // 3
+        } else if ( _parameter == PARAMETER.MINPRICE ) { // 4
             terms.minimumPrice = _input;
         }
+        emit LogSetTerms(_parameter, _input);
     }
 
     /**
@@ -609,8 +613,8 @@ contract MaiaBondDepository is Ownable {
         uint _increment, 
         uint _target,
         uint32 _buffer 
-    ) external onlyPolicy() {
-        require( _increment <= terms.controlVariable.mul( 25 )/ 1000, "Increment too large" );
+    ) external onlyOwner() {
+        require( _increment <= terms.controlVariable.mul( 25 ) / 1000 , "Increment too large" );
         require(_target >= 40, "Next Adjustment could be locked");
         adjustment = Adjust({
             add: _addition,
@@ -619,6 +623,7 @@ contract MaiaBondDepository is Ownable {
             buffer: _buffer,
             lastTime: uint32(block.timestamp)
         });
+        emit LogSetAdjustment(adjustment);
     }
 
     /**
@@ -626,8 +631,8 @@ contract MaiaBondDepository is Ownable {
      *  @param _staking address
      *  @param _helper bool
      */
-    function setStaking( address _staking, bool _helper ) external onlyPolicy() {
-        require( _staking != address(0) , "IA");
+    function setStaking( address _staking, bool _helper ) external onlyOwner() {
+        require( _staking != address(0), "IA" );
         if ( _helper ) {
             useHelper = true;
             stakingHelper = IStakingHelper(_staking);
@@ -635,15 +640,16 @@ contract MaiaBondDepository is Ownable {
             useHelper = false;
             staking = IStaking(_staking);
         }
+        emit LogSetStaking(_staking, _helper);
     }
 
-    function allowZapper(address zapper) external onlyPolicy {
+    function allowZapper(address zapper) external onlyOwner {
         require(zapper != address(0), "ZNA");
         
         allowedZappers[zapper] = true;
     }
 
-    function removeZapper(address zapper) external onlyPolicy {
+    function removeZapper(address zapper) external onlyOwner {
        
         allowedZappers[zapper] = false;
     }
@@ -664,12 +670,11 @@ contract MaiaBondDepository is Ownable {
         uint _amount, 
         uint _maxPrice,
         address _depositor
-    ) external payable returns ( uint ) {
+    ) external returns ( uint ) {
         require( _depositor != address(0), "Invalid address" );
         require(msg.sender == _depositor || allowedZappers[msg.sender], "LFNA");
         decayDebt();
-        require( totalDebt <= terms.maxDebt, "Max capacity reached" );
-        
+
         uint priceInUSD = bondPriceInUSD(); // Stored in bond info
         uint nativePrice = _bondPrice();
 
@@ -677,25 +682,28 @@ contract MaiaBondDepository is Ownable {
 
         uint value = treasury.valueOfToken( address(principle), _amount );
         uint payout = payoutFor( value ); // payout to bonder is computed
-
+        require( totalDebt.add(value) <= terms.maxDebt, "Max capacity reached" );
         require( payout >= 10000000, "Bond too small" ); // must be > 0.01 Time ( underflow protection )
         require( payout <= maxPayout(), "Bond too large"); // size protection because there is no slippage
 
+        // profits are calculated
+        uint fee = (payout.mul( terms.fee )).div(10000);
+        uint profit = value.sub( payout ).sub( fee );
+
+        uint balanceBefore = Time.balanceOf(address(this));
         /**
-            asset carries risk and is not minted against
-            asset transfered to treasury and rewards minted as payout
+            principle is transferred in
+            approved and
+            deposited into the treasury, returning (_amount - profit) Time
          */
-        if (address(this).balance >= _amount) {
-            // pay with WETH9
-            require(msg.value == _amount, "UA");
-            principle.deposit{value: _amount}(); // wrap only what is needed to pay
-            principle.transfer(address(treasury), _amount);
-        } else {
-            principle.safeTransferFrom( msg.sender, address(treasury), _amount );
+        principle.safeTransferFrom( msg.sender, address(this), _amount );
+        principle.approve( address( treasury ), _amount );
+        treasury.deposit( _amount, address(principle), profit );
+        
+        if ( fee != 0 ) { // fee is transferred to dao 
+            Time.safeTransfer( DAO, fee ); 
         }
-        
-        treasury.mintRewards( address(this), payout );
-        
+        require(balanceBefore.add(payout) == Time.balanceOf(address(this)), "Not enough Time to cover profit");
         // total debt is increased
         totalDebt = totalDebt.add( value ); 
                 
@@ -721,10 +729,12 @@ contract MaiaBondDepository is Ownable {
      *  @param _stake bool
      *  @return uint
      */ 
-    function redeem( address _recipient, bool _stake ) external returns ( uint ) { 
-        require(msg.sender == _recipient, "NA");       
+    function redeem( address _recipient, bool _stake ) external returns ( uint ) {
+        require(block.timestamp >= startRedeem, "Redeem has not started yet.");
+        require(msg.sender == _recipient, "NA");     
         Bond memory info = bondInfo[ _recipient ];
-        uint percentVested = percentVestedFor( _recipient ); // (seconds since last interaction / vesting term remaining)
+        // (seconds since last interaction / vesting term remaining)
+        uint percentVested = percentVestedFor( _recipient );
 
         if ( percentVested >= 10000 ) { // if fully vested
             delete bondInfo[ _recipient ]; // delete user info
@@ -733,13 +743,12 @@ contract MaiaBondDepository is Ownable {
 
         } else { // if unfinished
             // calculate payout vested
-            uint payout = info.payout.mul( percentVested )/ 10000;
-
+            uint payout = info.payout.mul( percentVested ) / 10000 ;
             // store updated deposit info
             bondInfo[ _recipient ] = Bond({
                 payout: info.payout.sub( payout ),
                 vesting: info.vesting.sub32( uint32( block.timestamp ).sub32( info.lastTime ) ),
-                lastTime: uint32( block.timestamp ),
+                lastTime: uint32(block.timestamp),
                 pricePaid: info.pricePaid
             });
 
@@ -778,22 +787,26 @@ contract MaiaBondDepository is Ownable {
      *  @notice makes incremental adjustment to control variable
      */
     function adjust() internal {
-         uint timeCanAdjust = adjustment.lastTime.add32( adjustment.buffer );
-         if( adjustment.rate != 0 && block.timestamp >= timeCanAdjust ) {
+        uint timeCanAdjust = adjustment.lastTime.add32( adjustment.buffer );
+        if( adjustment.rate != 0 && block.timestamp >= timeCanAdjust ) {
             uint initial = terms.controlVariable;
+            uint bcv = initial;
             if ( adjustment.add ) {
-                terms.controlVariable = terms.controlVariable.add( adjustment.rate );
-                if ( terms.controlVariable >= adjustment.target ) {
+                bcv = bcv.add(adjustment.rate);
+                if ( bcv >= adjustment.target ) {
                     adjustment.rate = 0;
+                    bcv = adjustment.target;
                 }
             } else {
-                terms.controlVariable = terms.controlVariable.sub( adjustment.rate );
-                if ( terms.controlVariable <= adjustment.target ) {
+                bcv = bcv.sub(adjustment.rate);
+                if ( bcv <= adjustment.target ) {
                     adjustment.rate = 0;
+                    bcv = adjustment.target;
                 }
             }
+            terms.controlVariable = bcv;
             adjustment.lastTime = uint32(block.timestamp);
-            emit ControlVariableAdjustment( initial, terms.controlVariable, adjustment.rate, adjustment.add );
+            emit ControlVariableAdjustment( initial, bcv, adjustment.rate, adjustment.add );
         }
     }
 
@@ -815,7 +828,7 @@ contract MaiaBondDepository is Ownable {
      *  @return uint
      */
     function maxPayout() public view returns ( uint ) {
-        return Time.totalSupply().mul( terms.maxPayout )/ 100000;
+        return (Time.totalSupply().add(50000000000000)).mul( terms.maxPayout ) / 100000 ;
     }
 
     /**
@@ -824,7 +837,7 @@ contract MaiaBondDepository is Ownable {
      *  @return uint
      */
     function payoutFor( uint _value ) public view returns ( uint ) {
-        return FixedPoint.fraction( _value, bondPrice() ).decode112with18()/ 1e14;
+        return FixedPoint.fraction( _value, bondPrice() ).decode112with18() / 1e16 ;
     }
 
 
@@ -833,7 +846,7 @@ contract MaiaBondDepository is Ownable {
      *  @return price_ uint
      */
     function bondPrice() public view returns ( uint price_ ) {        
-        price_ = terms.controlVariable.mul( debtRatio() )/ 1e5;
+        price_ = terms.controlVariable.mul( debtRatio() ).add( 1000000000 ) / 1e7;
         if ( price_ < terms.minimumPrice ) {
             price_ = terms.minimumPrice;
         }
@@ -853,19 +866,15 @@ contract MaiaBondDepository is Ownable {
     }
 
     /**
-     *  @notice get asset price from chainlink
-     */
-    function assetPrice() public view returns (int) {
-        ( , int price, , , ) = priceFeed.latestRoundData();
-        return price;
-    }
-
-    /**
      *  @notice converts bond price to DAI value
      *  @return price_ uint
      */
     function bondPriceInUSD() public view returns ( uint price_ ) {
-        price_ = bondPrice().mul( uint( assetPrice() ) ).mul( 1e6 );
+        if( isLiquidityBond ) {
+            price_ = bondPrice().mul( bondCalculator.markdown( address(principle) ) ) / 100 ;
+        } else {
+            price_ = bondPrice().mul( 10 ** principle.decimals() ) / 100;
+        }
     }
 
 
@@ -874,19 +883,23 @@ contract MaiaBondDepository is Ownable {
      *  @return debtRatio_ uint
      */
     function debtRatio() public view returns ( uint debtRatio_ ) {   
-        uint supply = Time.totalSupply();
+        uint supply = Time.totalSupply().add(50000000000000);
         debtRatio_ = FixedPoint.fraction( 
             currentDebt().mul( 1e9 ), 
             supply
-        ).decode112with18()/ 1e18;
+        ).decode112with18() / 1e18;
     }
 
     /**
-     *  @notice debt ratio in same terms as reserve bonds
+     *  @notice debt ratio in same terms for reserve or liquidity bonds
      *  @return uint
      */
     function standardizedDebtRatio() external view returns ( uint ) {
-        return debtRatio().mul( uint( assetPrice() ) )/ 10**priceFeed.decimals(); // ETH feed is 8 decimals
+        if ( isLiquidityBond ) {
+            return debtRatio().mul( bondCalculator.markdown( address(principle) ) ) / 1e9;
+        } else {
+            return debtRatio();
+        }
     }
 
     /**
@@ -921,7 +934,7 @@ contract MaiaBondDepository is Ownable {
         uint vesting = bond.vesting;
 
         if ( vesting > 0 ) {
-            percentVested_ = (secondsSinceLast.mul( 10000 )).div(vesting);
+            percentVested_ = secondsSinceLast.mul( 10000 ) / vesting;
         } else {
             percentVested_ = 0;
         }
@@ -939,7 +952,7 @@ contract MaiaBondDepository is Ownable {
         if ( percentVested >= 10000 ) {
             pendingPayout_ = payout;
         } else {
-            pendingPayout_ = payout.mul( percentVested )/ 10000;
+            pendingPayout_ = payout.mul( percentVested ) / 10000;
         }
     }
 
@@ -952,10 +965,12 @@ contract MaiaBondDepository is Ownable {
      *  @notice allow anyone to send lost tokens (excluding principle or Time) to the DAO
      *  @return bool
      */
-    function recoverLostToken( IERC20 _token ) external returns ( bool ) {
+    function recoverLostToken(IERC20 _token ) external returns ( bool ) {
         require( _token != Time, "NAT" );
         require( _token != principle, "NAP" );
-        _token.safeTransfer( DAO, _token.balanceOf( address(this) ) );
+        uint balance = _token.balanceOf( address(this));
+        _token.safeTransfer( DAO,  balance );
+        emit LogRecoverLostToken(address(_token), balance);
         return true;
     }
 

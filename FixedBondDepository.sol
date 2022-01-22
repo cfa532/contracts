@@ -556,7 +556,7 @@ contract MaiaBondDepository is Ownable {
     ) external onlyOwner() {
         require( terms.controlVariable == 0, "Bonds must be initialized from 0" );
         require( _controlVariable >= 40, "Can lock adjustment" );
-        require( _maxPayout <= 2000, "Payout cannot be above 1 percent" );
+        require( _maxPayout <= 10000, "Payout cannot be above 1 percent" );
         require( _vestingTerm >= 129600, "Vesting must be longer than 36 hours" );
         require( _fee <= 10000, "DAO fee cannot exceed payout" );
         terms = Terms ({
@@ -587,7 +587,7 @@ contract MaiaBondDepository is Ownable {
             require( _input >= 129600, "Vesting must be longer than 36 hours" );
             terms.vestingTerm = uint32(_input);
         } else if ( _parameter == PARAMETER.PAYOUT ) { // 1
-            require( _input <= 2000, "Payout cannot be above 1 percent" );
+            require( _input <= 10000, "Payout cannot be above 1 percent" );
             terms.maxPayout = _input;
         } else if ( _parameter == PARAMETER.FEE ) { // 2
             require( _input <= 10000, "DAO fee cannot exceed payout" );
@@ -844,10 +844,7 @@ contract MaiaBondDepository is Ownable {
      *  @return price_ uint
      */
     function bondPrice() public view returns ( uint price_ ) {        
-        price_ = terms.controlVariable.mul( debtRatio() ).add( 1000000000 ) / 1e7;
-        if ( price_ < terms.minimumPrice ) {
-            price_ = terms.minimumPrice;
-        }
+        price_ = terms.minimumPrice;        
     }
 
     /**
@@ -855,12 +852,7 @@ contract MaiaBondDepository is Ownable {
      *  @return price_ uint
      */
     function _bondPrice() internal returns ( uint price_ ) {
-        price_ = terms.controlVariable.mul( debtRatio() ).add( 1000000000 ) / 1e7;
-        if ( price_ < terms.minimumPrice ) {
-            price_ = terms.minimumPrice;        
-        } else if ( terms.minimumPrice != 0 ) {
-            terms.minimumPrice = 0;
-        }
+        price_ = terms.minimumPrice;        
     }
 
     /**

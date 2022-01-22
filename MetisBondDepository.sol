@@ -396,36 +396,6 @@ library FixedPoint {
     }
 }
 
-interface AggregatorV3Interface {
-
-  function decimals() external view returns (uint8);
-  function description() external view returns (string memory);
-  function version() external view returns (uint256);
-
-  // getRoundData and latestRoundData should both raise "No data present"
-  // if they do not have data to report, instead of returning unset values
-  // which could be misinterpreted as actual reported values.
-  function getRoundData(uint80 _roundId)
-    external
-    view
-    returns (
-      uint80 roundId,
-      int256 answer,
-      uint256 startedAt,
-      uint256 updatedAt,
-      uint80 answeredInRound
-    );
-  function latestRoundData()
-    external
-    view
-    returns (
-      uint80 roundId,
-      int256 answer,
-      uint256 startedAt,
-      uint256 updatedAt,
-      uint80 answeredInRound
-    );
-}
 
 interface ITreasury {
     function deposit( uint _amount, address _token, uint _profit ) external returns ( uint );
@@ -472,8 +442,6 @@ contract MaiaBondDepository is Ownable {
     IWMATIC9 public immutable principle; // token used to create bond
     ITreasury public immutable treasury; // mints Time when receives principle
     address public immutable DAO; // receives profit share from bond
-
-    AggregatorV3Interface public priceFeed;
 
     IStaking public staking; // to auto-stake payout
     IStakingHelper public stakingHelper; // to stake and claim if no staking warmup
@@ -528,8 +496,7 @@ contract MaiaBondDepository is Ownable {
         address _Time,
         address _principle,
         address _treasury, 
-        address _DAO,
-        address _feed
+        address _DAO
     ) {
         require( _Time != address(0) );
         Time = IERC20(_Time);
@@ -539,8 +506,6 @@ contract MaiaBondDepository is Ownable {
         treasury = ITreasury(_treasury);
         require( _DAO != address(0) );
         DAO = _DAO;
-        require( _feed != address(0) );
-        priceFeed = AggregatorV3Interface( _feed );
     }
 
     /**
@@ -852,20 +817,13 @@ contract MaiaBondDepository is Ownable {
         }
     }
 
-    /**
-     *  @notice get asset price from chainlink
-     */
-    function assetPrice() public view returns (int) {
-        ( , int price, , , ) = priceFeed.latestRoundData();
-        return price;
-    }
 
     /**
      *  @notice converts bond price to DAI value
      *  @return price_ uint
      */
     function bondPriceInUSD() public view returns ( uint price_ ) {
-        price_ = bondPrice().mul( uint( assetPrice() ) ).mul( 1e6 );
+        price_ = bondPrice().mul( 1e6 );
     }
 
 
@@ -881,13 +839,6 @@ contract MaiaBondDepository is Ownable {
         ).decode112with18()/ 1e18;
     }
 
-    /**
-     *  @notice debt ratio in same terms as reserve bonds
-     *  @return uint
-     */
-    function standardizedDebtRatio() external view returns ( uint ) {
-        return debtRatio().mul( uint( assetPrice() ) )/ 10**priceFeed.decimals(); // ETH feed is 8 decimals
-    }
 
     /**
      *  @notice calculate debt factoring in decay

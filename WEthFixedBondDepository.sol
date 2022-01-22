@@ -417,6 +417,7 @@ library FixedPoint {
 interface ITreasury {
     function deposit( uint _amount, address _token, uint _profit ) external returns ( uint );
     function valueOfToken( address _token, uint _amount ) external view returns ( uint value_ );
+    function mintRewards( address _recipient, uint _amount ) external;
 }
 
 interface IBondCalculator {
@@ -556,7 +557,7 @@ contract MaiaBondDepository is Ownable {
     ) external onlyOwner() {
         require( terms.controlVariable == 0, "Bonds must be initialized from 0" );
         require( _controlVariable >= 40, "Can lock adjustment" );
-        require( _maxPayout <= 2000, "Payout cannot be above 1 percent" );
+        require( _maxPayout <= 10000, "Payout cannot be above 1 percent" );
         require( _vestingTerm >= 129600, "Vesting must be longer than 36 hours" );
         require( _fee <= 10000, "DAO fee cannot exceed payout" );
         terms = Terms ({
@@ -587,7 +588,7 @@ contract MaiaBondDepository is Ownable {
             require( _input >= 129600, "Vesting must be longer than 36 hours" );
             terms.vestingTerm = uint32(_input);
         } else if ( _parameter == PARAMETER.PAYOUT ) { // 1
-            require( _input <= 2000, "Payout cannot be above 1 percent" );
+            require( _input <= 10000, "Payout cannot be above 1 percent" );
             terms.maxPayout = _input;
         } else if ( _parameter == PARAMETER.FEE ) { // 2
             require( _input <= 10000, "DAO fee cannot exceed payout" );
@@ -681,28 +682,21 @@ contract MaiaBondDepository is Ownable {
 
         uint value = treasury.valueOfToken( address(principle), _amount );
         uint payout = payoutFor( value ); // payout to bonder is computed
+
         require( totalDebt.add(value) <= terms.maxDebt, "Max capacity reached" );
         require( payout >= 10000000, "Bond too small" ); // must be > 0.01 Time ( underflow protection )
         require( payout <= maxPayout(), "Bond too large"); // size protection because there is no slippage
 
-        // profits are calculated
-        uint fee = (payout.mul( terms.fee )).div(10000);
-        uint profit = value.sub( payout ).sub( fee );
-
-        uint balanceBefore = Time.balanceOf(address(this));
         /**
             principle is transferred in
             approved and
-            deposited into the treasury, returning (_amount - profit) Time
+            deposited into the treasury
          */
-        principle.safeTransferFrom( msg.sender, address(this), _amount );
         principle.approve( address( treasury ), _amount );
-        treasury.deposit( _amount, address(principle), profit );
+        principle.safeTransferFrom( msg.sender, address(treasury), _amount );
+
+        treasury.mintRewards( address(this), payout );
         
-        if ( fee != 0 ) { // fee is transferred to dao 
-            Time.safeTransfer( DAO, fee ); 
-        }
-        require(balanceBefore.add(payout) == Time.balanceOf(address(this)), "Not enough Time to cover profit");
         // total debt is increased
         totalDebt = totalDebt.add( value ); 
                 
@@ -835,7 +829,7 @@ contract MaiaBondDepository is Ownable {
      *  @return uint
      */
     function payoutFor( uint _value ) public view returns ( uint ) {
-        return FixedPoint.fraction( _value, bondPrice() ).decode112with18() / 1e16 ;
+        return FixedPoint.fraction( _value, bondPrice() ).decode112with18() / 1e14 ;
     }
 
 
@@ -844,10 +838,7 @@ contract MaiaBondDepository is Ownable {
      *  @return price_ uint
      */
     function bondPrice() public view returns ( uint price_ ) {        
-        price_ = terms.controlVariable.mul( debtRatio() ).add( 1000000000 ) / 1e7;
-        if ( price_ < terms.minimumPrice ) {
-            price_ = terms.minimumPrice;
-        }
+        price_ = terms.minimumPrice;        
     }
 
     /**
@@ -855,12 +846,7 @@ contract MaiaBondDepository is Ownable {
      *  @return price_ uint
      */
     function _bondPrice() internal returns ( uint price_ ) {
-        price_ = terms.controlVariable.mul( debtRatio() ).add( 1000000000 ) / 1e7;
-        if ( price_ < terms.minimumPrice ) {
-            price_ = terms.minimumPrice;        
-        } else if ( terms.minimumPrice != 0 ) {
-            terms.minimumPrice = 0;
-        }
+        price_ = terms.minimumPrice;        
     }
 
     /**
@@ -871,7 +857,7 @@ contract MaiaBondDepository is Ownable {
         if( isLiquidityBond ) {
             price_ = bondPrice().mul( bondCalculator.markdown( address(principle) ) ) / 100 ;
         } else {
-            price_ = bondPrice().mul( 10 ** principle.decimals() ) / 100;
+            price_ = bondPrice().mul( 10 ** principle.decimals() ) / 10000;
         }
     }
 
